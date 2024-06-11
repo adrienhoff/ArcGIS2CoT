@@ -1,0 +1,197 @@
+import json
+import xml.etree.ElementTree as ET
+from arcgis.gis import GIS
+from datetime import datetime, timedelta
+import socket
+import ssl
+import time  
+
+CERT_FILE = r"\\Path\\to\\your\\crt.pem" #path to your cert
+KEY_FILE = r"\\Path\\to\\your\\key.pem" #path to your key
+
+TAK_IP = "00.00.000.00" #specify your IP
+TAK_PORT = 8086 #specify port
+
+def unescape(s):
+    s = s.replace("&lt;", "<")
+    s = s.replace("&gt;", ">")
+    s = s.replace("&amp;", "&")
+    return s
+
+def fetch_fire_data():
+    # Connect to the ArcGIS Online account
+    gis = GIS(url="https://geospatial.alberta.ca/portal")
+    item = gis.content.get("0b775584ff2e4e2a8f0689a339614258")
+    feature_layer = item.layers[0]
+    fields = feature_layer.properties.fields
+
+
+    # Query features and retrieve attributes
+    fire_date_filter = '2023-03-01'
+    query = "FIRE_STATUS_DATE >= '{}'".format(fire_date_filter)
+
+#to specifically filter anything from today or thereafter, comment out the above and uncomment the below:
+    
+##    today = datetime.now().strftime('%Y-%m-%d')
+##    query = "FIRE_STATUS_DATE >= '{}'".format(today)
+    
+    features = feature_layer.query(where=query, return_geometry=True)
+
+    print(f"Retrieved {len(features)} features")
+
+    return features
+
+def construct_cot_message(features):
+    print("Constructing CoT messages...")
+
+    now = datetime.utcnow()
+    24hrs_from_now = now + timedelta(minutes=1440)
+    cot_messages = []
+
+    for feature in features:
+        attributes = feature.attributes
+        # Extract attributes
+        uid = attributes["OBJECTID"]  
+        callsign = attributes["FIRE_NUMBER"]  
+        lat = attributes["LATITUDE"]  
+        lon = attributes["LONGITUDE"]
+        hae = '9999999.0'
+        ce = '9999999.0'
+        le ='9999999.0'
+        time = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        start = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        stale = 24hrs_from_now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        remarks_url = 'https://www.arcgis.com/apps/dashboards/5053f80a5f2e49e5b1e01cc0ee6bcf82'  
+        LABEL = attributes["LABEL"]
+        FIRE_NUMBER = attributes["FIRE_NUMBER"]
+        FIRE_YEAR = attributes["FIRE_YEAR"] 
+        FIRE_TYPE = attributes["FIRE_TYPE"] 
+        FIRE_STATUS = attributes["FIRE_STATUS"] 
+        FIRE_STATUS_DATE = attributes["FIRE_STATUS_DATE"] 
+        INCIDENT_TYPE = attributes["INCIDENT_TYPE"] 
+        SIZE_CLASS = attributes["SIZE_CLASS"] 
+        AREA_ESTIMATE = attributes["AREA_ESTIMATE"] 
+        ASSESSMENT_ASSISTANCE_DATE = attributes["ASSESSMENT_ASSISTANCE_DATE"] 
+        GENERAL_CAUSE = attributes["GENERAL_CAUSE"]
+        
+        if ASSESSMENT_ASSISTANCE_DATE is not None:
+            # Convert milliseconds to seconds
+            timestamp_seconds = ASSESSMENT_ASSISTANCE_DATE / 1000
+
+            # Convert timestamp to datetime object
+            ASSESSMENT_ASSISTANCE_DATE_CONVERTED = datetime.utcfromtimestamp(timestamp_seconds)
+
+        remarks_text = """UID: {}
+        FIRE NUMBER: {}
+        FIRE LABEL: {}
+        FIRE_YEAR: {}
+        FIRE TYPE: {}
+        FIRE STATUS: {}
+        FIRE STATUS DATE: {}
+        INCIDENT TYPE: {}
+        SIZE CLASS: {}
+        AREA ESTIMATE: {}
+        ASSESSMENT ASSISTANCE DATE: {}
+        GENERAL CAUSE: {}""".format(uid, FIRE_NUMBER, LABEL, FIRE_YEAR, FIRE_TYPE, FIRE_STATUS, FIRE_STATUS_DATE, INCIDENT_TYPE, SIZE_CLASS, AREA_ESTIMATE, ASSESSMENT_ASSISTANCE_DATE_CONVERTED, GENERAL_CAUSE)
+
+
+        # Create XML element for the CoT message
+        event = ET.Element("event")
+        event.set("version", "2.0")
+        event.set("uid", str(uid))
+        event.set("type", "a-n-G")
+        event.set("time", str(time))
+        event.set("start", str(start))
+        event.set("stale", str(stale))
+        event.set("how", "h-g-i-g-o")
+
+        # Create point element
+        point = ET.SubElement(event, "point")
+        point.set("lat", str(lat))
+        point.set("lon", str(lon))
+        point.set("hae", str(hae))
+        point.set("ce", str(ce))
+        point.set("le", str(le))
+
+        # Create detail element
+        detail = ET.SubElement(event, "detail")
+        link = ET.SubElement(detail, "link")
+        link.set("url", remarks_url)
+        link.set("mime", "text/html")
+        link.set("relation", "r-u")
+        link.set("uid", str(uid))
+        link.set("remarks", "LINK TO FIRE MAP")
+
+        # Add usericon element
+        usericon = ET.SubElement(detail, "usericon")
+        
+        if FIRE_STATUS == 'Out of Control':
+            usericon.set("iconsetpath", "f7f71666-8b28-4b57-9fbb-e38e61d33b79/Google/firedept.png")
+        else:
+            usericon.set("iconsetpath", "ad78aafb-83a6-4c07-b2b9-a897a8b6a38f/Shapes/firedept.png")
+
+
+        color = ET.SubElement(detail, "color")
+        if FIRE_STATUS == 'Out of Control':
+            color.set("argb", "-1")  # use Google default red color
+        else:
+            color.set("argb", "-35072")  # orange color
+        
+        contact = ET.SubElement(detail, "contact")
+        contact.set("callsign", callsign)
+
+        precisionlocation = ET.SubElement(detail, "precisionlocation")
+        precisionlocation.set("altsrc", "DTED0")
+
+        remarks = ET.SubElement(detail, "remarks")
+        remarks.text = remarks_text
+
+        cot_messages.append(event)
+        
+    print(f"Constructed {len(cot_messages)} CoT messages")
+    return cot_messages
+
+def send_cot_messages(cot_messages):
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    context.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ssl_sock = context.wrap_socket(sock, server_hostname=TAK_IP)
+
+    ssl_sock.connect((TAK_IP, TAK_PORT))
+
+    for cot_message in cot_messages:
+        cot_message_xml = ET.tostring(cot_message, encoding='utf-8', method='xml')
+        ssl_sock.sendall(cot_message_xml)
+        print("Sent message: ", cot_message_xml)
+
+    ssl_sock.close()
+    print("All messages sent successfully")
+
+
+def main():
+    while True:
+        try:
+            # Fetch and process data
+            features = fetch_fire_data()
+            cot_messages = construct_cot_message(features)
+            send_cot_messages(cot_messages)
+            print("Messages sent. Restarting the script in 24 hours...")
+            
+            # Calculate the time until the next run (next day at the same time), if loaded into nssm this will continue running as a process
+            now = datetime.now()
+            next_run = now + timedelta(days=1)
+            next_run = next_run.replace(hour=0, minute=0, second=0, microsecond=0)
+            time_to_sleep = (next_run - now).total_seconds()
+            
+        except Exception as e:
+            print(f"Error: {e}")
+            # If an error occurs, try again in 30 min
+            time_to_sleep = 30 * 60
+        
+        # Sleep until the next run
+        time.sleep(time_to_sleep)
+
+
+if __name__ == "__main__":
+    main()
